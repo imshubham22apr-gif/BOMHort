@@ -531,179 +531,30 @@ The same applied to `cluster` when #131 shipped.
 
 ## 3. License Exceptions
 
-License exceptions suppress specific license violations. They are stored in a **ConfigMap** that is mounted read-only into the API Gateway and Workers.
+License exceptions suppress specific license violations. They come from exactly
+one source, which the API Gateway and the workers re-read every
+`licenseExceptions.refreshInterval` (default `60s`):
+
+| Source | Set | Use when |
+|--------|-----|----------|
+| Chart-rendered ConfigMap | `licenseExceptions.custom` (default) | the rules live in your Helm values |
+| Your own ConfigMap | `licenseExceptions.existingConfigMap` | a second GitOps source / kustomize manages the reviewed file |
+| URL or S3 object | `licenseExceptions.source` | the rules live outside the cluster, e.g. in a governance repository |
 
 **No exceptions are enabled or downloaded by default.** Adapt the inactive
 `examples/license-exceptions/license-exceptions.example.json` structure to your
-organization and approve only reviewed rules. Configure it with your normal values:
+organization and approve only reviewed rules:
 
 ```bash
 helm upgrade --install bomhort deploy/helm/bomhort -n bomhort \
   -f my-values.yaml --set-file licenseExceptions.custom=./my-exceptions.json
 ```
 
-`licenseExceptions.custom` also accepts a YAML object. An explicit empty template is:
-
-```yaml
-licenseExceptions:
-  enabled: true
-  custom:
-    version: "1.0.0"
-    blanketExceptions: []
-    exceptions: []
-```
-
-Use camelCase `blanketExceptions` and `package` (not `blanket_exceptions` or
-`purl_prefix`). Both arrays are required. Only `status: "approved"` or
-`"allowlisted"` activates a rule — every other value, including `denied`,
-`not-eligible` and typos, leaves the entry inactive. Package names match exactly
-or as complete slash-delimited suffixes; `project` is an exact SBOM document
-name (omit it, use `"*"`, or phrase it as `all <qualifier> projects` for all
-projects). A project scope never removes a rule's package restriction. Files
-exported from a published exception registry load as-is: the provenance fields
-`results`, `issueUrl` and `packageUrl` are accepted and kept as audit metadata.
-Audit fields such as `scope` and dates are informational, not automatically
-enforced conditions.
-
-Empty lists are authoritative and never load old approvals from the SBOM directory.
-Fallback is allowed only when the primary file is absent. Invalid configuration
-stops the worker and returns HTTP 500 from exception-related API endpoints.
-Keep the ConfigMap enabled with empty lists to disable approvals; disabling the
-mount alone does not disable the legacy SBOM-directory fallback.
-
-Helm changes restart **both** API and workers via checksums. Direct ConfigMap
-edits require manually restarting both deployments because of `subPath` mounts.
-**Re-process existing SBOMs** to update stored compliance data, especially after
-revoking approvals; a watcher run alone skips unchanged hashes. Back up data
-before a full re-scan; development reset helpers delete ingested data.
-
-For upgrades, remove `seedJob.cncfExceptionsURL` (also from retained Helm values)
-and supply reviewed rules explicitly. `"All CNCF Projects"` is now a literal
-project name, not a global approval. The default license classification policy
-is unchanged.
-
-### Argo CD (GitOps)
-
-License exception updates also work when Argo CD renders the chart with
-`helm template`: the rollout mechanism does **not** depend on running
-`helm upgrade` or on a Helm upgrade hook.
-
-Keep exceptions in your GitOps repository, either in a Helm values file referenced
-by `spec.source.helm.valueFiles` or directly in `spec.source.helm.valuesObject`.
-The following is a **fragment to merge into your existing Application**, not a
-complete deployment manifest. For multi-source Applications, use the Helm chart
-entry under `spec.sources[]` instead of `spec.source`.
-
-```yaml
-spec:
-  source:
-    helm:
-      valuesObject:
-        licenseExceptions:
-          enabled: true
-          custom:
-            version: "1.0.0"
-            blanketExceptions: []
-            exceptions:
-              - id: example-review-required
-                package: example.org/your-team/your-library
-                license: MPL-2.0
-                project: your-exact-sbom-document-name
-                status: pending
-                approvedDate: ""
-                comment: "Example only; requires organization approval."
-```
-
-This example grants **no approval**. Replace the placeholders, review the rule,
-then explicitly set `status: approved` only after approval. To remove all
-approvals, keep `enabled: true` and set both arrays to `[]`.
-
-If your Argo CD Application CRD does not support `valuesObject`, use a committed
-values file or the equivalent YAML in `helm.values`. Do not rely on a workstation's
-local `--set-file` invocation: Argo must receive the configuration through its own
-Git-backed Helm inputs. Avoid defining the same exceptions in multiple layers;
-`valuesObject` overrides `valueFiles`, and Helm `parameters` override both.
-
-**What happens on a change:**
-
-1. Commit the reviewed values and let Argo refresh the desired manifests.
-2. The rendered ConfigMap data changes, together with
-   `spec.template.metadata.annotations.checksum/license-exceptions` on **both**
-   the API Gateway and parsing-worker Deployments. Checksums are deterministic:
-   unchanged configuration does not cause repeated rollouts.
-3. At the next sync (manual or automated according to your Application policy),
-   Argo applies the ConfigMap and both Deployment changes. Kubernetes rolls out
-   new pods, refreshing the read-only `subPath` mounts. No manual restart is needed.
-
-**Deployment checklist:**
-
-- Point Argo at a chart revision **and API/worker image versions containing these
-  fixes**. Updating only the chart does not update the matching/loading behavior
-  in older binaries. Local, unpushed changes are not available to Argo.
-- Remove `seedJob.cncfExceptionsURL` from all GitOps values and parameter overrides;
-  the chart rejects this retired option with a migration hint.
-- For an exception-only change, check the Argo diff for the ConfigMap and both
-  Deployment checksum annotations. Sync all affected resources, not just the
-  ConfigMap, and do not configure diff/sync rules that suppress the checksum changes.
-- Wait for both Deployments to become healthy. Verify the configured rules through
-  `GET /api/v1/license-exceptions` or the UI's **Configured Exceptions** tab.
-- **Re-process existing SBOMs separately** to update stored compliance results.
-  Argo syncing and pod rollouts do not perform a license re-scan; the ingestion
-  watcher skips unchanged hashes. Plan and back up any full re-scan, particularly
-  when revoking old approvals.
-
-Do not edit the managed ConfigMap with `kubectl edit` as a normal configuration
-workflow: the next Argo sync or self-heal can overwrite the change. Git is the
-source of truth for the exceptions and their review history.
-
-#### Reviewed rules from their own source: `existingConfigMap`
-
-Inlining a large reviewed file — the CNCF foundation exceptions are ~180 KB —
-into an Application turns every upstream refresh into a huge diff in an
-unrelated manifest. Instead, let a second source manage the ConfigMap and point
-the chart at it:
-
-```yaml
-spec:
-  sources:
-    - repoURL: ghcr.io/seebom-labs/bomhort/charts
-      chart: bomhort
-      targetRevision: 0.8.0
-      helm:
-        valuesObject:
-          licenseExceptions:
-            existingConfigMap: license-exceptions   # mutually exclusive with custom
-            # existingConfigMapKey: license-exceptions.json   # default
-          # licensePolicy:
-          #   existingConfigMap: license-policy             # same mechanism
-    - repoURL: https://github.com/your-org/compliance.git
-      targetRevision: main
-      path: bomhort/license-exceptions      # contains the kustomization below
-```
-
-```yaml
-# bomhort/license-exceptions/kustomization.yaml
-configMapGenerator:
-  - name: license-exceptions
-    files:
-      - license-exceptions.json=exceptions.json   # the reviewed file, verbatim
-    options:
-      disableNameSuffixHash: true
-```
-
-The chart then renders no exceptions ConfigMap and mounts the named one, mapping
-`existingConfigMapKey` to `license-exceptions.json`. Setting both `custom` and
-`existingConfigMap` fails the render. If the referenced ConfigMap does not
-exist, the pods do not start: running without the reviewed rules would be worse.
-
-**Rollouts are your responsibility in this mode.** The chart cannot hash a
-ConfigMap it does not render, so the `checksum/license-exceptions` annotation is
-replaced by `bomhort.io/license-exceptions-configmap: <name>` — switching to a
-different ConfigMap rolls both Deployments, editing the content of the same one
-does not. After the ConfigMap changes, restart both Deployments
-(`kubectl rollout restart deployment/<release>-api-gateway deployment/<release>-parsing-worker`)
-and re-process SBOMs as above. If that is too easy to forget, keep using
-`custom`, where Argo rolls the pods for you.
+A change needs neither a restart nor a re-scan: the pods reload the rules and
+**granting or revoking an exception applies to every SBOM already ingested**.
+The rule format, the `source` / `existingConfigMap` options, the Argo CD
+workflow and how the retroactive re-check works are on the dedicated
+[License Exceptions](/docs/license-exceptions/) page.
 
 ---
 
@@ -728,7 +579,7 @@ kubectl rollout restart deployment bomhort-api-gateway bomhort-parsing-worker
 To manage the policy outside the chart, set `licensePolicy.existingConfigMap`
 (key `licensePolicy.existingConfigMapKey`, default `license-policy.json`). It
 works exactly like
-[`licenseExceptions.existingConfigMap`](#reviewed-rules-from-their-own-source-existingconfigmap),
+[`licenseExceptions.existingConfigMap`](/docs/license-exceptions/#reviewed-rules-from-their-own-source-existingconfigmap),
 including the restart after a content change.
 
 ### Compound SPDX expressions
@@ -841,6 +692,11 @@ is `img-src 'self' data:`), i.e. either a path served by the UI container or
 a `data:` URI. Locally, `BRAND_ASSETS=./my-brand make dev` mounts a directory
 at `/brand/`; in Kubernetes, mount a ConfigMap/volume with the file into the
 UI container at `/usr/share/nginx/html/brand/`.
+
+Locally with Docker Compose, the same keys live in `ui/public/ui-config.json`;
+point `UI_CONFIG=./my-ui-config.json` in `.env` at your own file and run
+`docker compose up -d --force-recreate ui`. All fields are optional and fall
+back to the built-in BOMHort default.
 
 ---
 
@@ -1371,7 +1227,7 @@ kubectl exec -it $(kubectl get pod -l app.kubernetes.io/component=api-gateway -o
 | **SBOMs (volume)** | PVC via git-sync or populated by you | Push to Git (git-sync re-syncs) or copy into the PVC |
 | **SBOMs (push/CI-CD)** | `skipScan` S3 bucket, or PVC | `POST /api/v1/sboms/upload` — see [Option E](#option-e-push-model-uploads-cicd) |
 | **VEX files** | Same S3 bucket or directory | Place `*.openvex.json` alongside SBOMs |
-| **License Exceptions** | ConfigMap (chart-rendered, or your own via `existingConfigMap`) | `licenseExceptions.custom` in Git → Helm upgrade / [Argo sync](#argo-cd-gitops) → API + worker rollout → re-process existing SBOMs. With [`existingConfigMap`](#reviewed-rules-from-their-own-source-existingconfigmap): new ConfigMap name or `kubectl rollout restart` |
+| **License Exceptions** | ConfigMap (chart-rendered, or your own via `existingConfigMap`), or a URL / S3 object via `source` | Update the ConfigMap or the remote file → pods reload within `refreshInterval` → stored results [re-checked automatically](/docs/license-exceptions/#retroactive-application) |
 | **License Policy** | ConfigMap (chart-rendered, or your own via `existingConfigMap`) | `kubectl edit configmap` (or update your own ConfigMap) → restart API + Workers |
 | **Custom Theme** | ConfigMap | `kubectl create configmap` → restart UI |
 | **Site Config** | ConfigMap | Helm values `ui.siteConfig.content.*` → restart UI |
