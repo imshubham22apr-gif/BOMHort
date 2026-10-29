@@ -374,6 +374,34 @@ asks "what state is this job in" goes through one subquery (`latestJobs` in
 
 Tests: `internal/clickhouse/queue_retry_integration_test.go` (live).
 
+### Claim ordering and exclusive claims (#446, #483)
+
+`created_at` is the ReplacingMergeTree version and the `argMax` key, so it
+decides which row is a job's current state. Two rules keep it honest:
+
+- **One clock, strictly increasing.** `created_at` is `DateTime64(3)`
+  (migration `028`, a table rebuild: the version column of a
+  ReplacingMergeTree cannot be re-typed with `ALTER`). Every transition is
+  written on the ClickHouse clock and at least 1 ms after the job's previous
+  row (`nextVersion` in `queue.go`; `IngestionJob.Version` carries the
+  previous row's time). A worker with a fast clock can therefore not write a
+  claim that outranks its own completion, and two transitions never tie.
+- **Claims are serialised.** `ClaimJobs` runs under `claimlock.Locker`. On
+  Kubernetes that is a Lease (`bomhort-ingestion-queue-claims`, client-go
+  leader election, 15 s/10 s/2 s, RBAC in `claim-lock-rbac.yaml`,
+  `POD_NAMESPACE` from the downward API); outside Kubernetes an in-process
+  mutex, which is why Compose runs one worker (`WORKER_REPLICAS=1`). A claim
+  whose critical section outlived `maxHold` (5 s) or lost the Lease is
+  discarded (`ErrLeaseLost`); the rows it already wrote are `processing`
+  under this worker's id, and the worker's next `ClaimJobs` requeues its own
+  leftover claims before claiming again, so they do not wait for the hourly
+  sweep. After the insert, `ownClaimedJobIDs` re-reads the latest state and
+  returns only jobs this worker still owns.
+
+Tests: `internal/claimlock/lock_test.go` (fake clientset),
+`internal/clickhouse/queue_claim_integration_test.go` (live: concurrent
+claims, superseded claim, clock skew, abandoned claims).
+
 ### Ingestion Path Layout (`internal/ingestpath`)
 
 Teams already organise buckets hierarchically. Rather than guessing that
@@ -489,6 +517,10 @@ Moved to Section 10 for comprehensive coverage including exemptions and visual r
 | `/archived-packages` | ArchivedPackagesComponent | Grouped by repo, project aggregation with version tags, stars, last push |
 
 **All components:** Standalone, OnPush change detection, lazy-loaded.
+
+**Parity gate:** `ui/e2e/` (Playwright) drives every route above through nginx against a demo-fleet stack and `e2e/bundle-size.mjs` checks the production bundle against a committed baseline — the contract any frontend refactor or component extraction has to keep (see Development → Testing).
+
+**Reusable packages (`ui/packages/`):** `@bomhort/api-client` is a zero-dependency fetch client with all DTO types (the Angular `ApiService` is proven equivalent by `api-client-parity.spec.ts`); `@bomhort/elements` builds the shared charts, scope badge/matrix and vuln aliases into framework-independent custom elements, plus `<bomhort-page route=…>`, which renders any app route through the real router on an in-memory `LocationStrategy` (`src/elements/page.component.ts`) and emits `navigate` to the host — so every page of the UI is embeddable without a second implementation via `@angular/elements` (`ng run ui:build-elements`, API base from `window.BOMHORT_API_URL`, injected through the `API_BASE_URL` token); `@bomhort/react` wraps those elements for React apps. The Angular app itself keeps its own bundle — the extraction adds a second build entry (`src/elements/main.ts`), not a rewrite.
 
 **Theming:**
 - 60+ CSS custom properties in `styles.scss` (layout, brand, navbar, text, severity, status, license, charts)

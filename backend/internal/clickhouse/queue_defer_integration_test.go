@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/seebom-labs/bomhort/backend/internal/claimlock"
 	"github.com/seebom-labs/bomhort/backend/pkg/models"
 )
 
@@ -34,8 +35,9 @@ func TestDeferJobRespectsRetryAfter(t *testing.T) {
 		t.Fatalf("EnqueueJobs: %v", err)
 	}
 
+	locker := claimlock.Local()
 	claimed := func() bool {
-		jobs, err := c.ClaimJobs(ctx, "defer-test", 1000)
+		jobs, err := c.ClaimJobs(ctx, "defer-test", 1000, locker)
 		if err != nil {
 			t.Fatalf("ClaimJobs: %v", err)
 		}
@@ -51,15 +53,14 @@ func TestDeferJobRespectsRetryAfter(t *testing.T) {
 		t.Fatal("freshly enqueued job (retry_after = epoch) was not claimable")
 	}
 
-	// created_at is a DateTime with second resolution, so two queue rows written
-	// within the same second tie in argMax. Production never writes two deferral
-	// rows that close together (the retry is an hour away); the test has to wait.
-	tick := func() { time.Sleep(1100 * time.Millisecond) }
+	// Keep queue transitions in distinct DateTime64(3) ticks.
+	tick := func() { time.Sleep(10 * time.Millisecond) }
 
 	tick()
 	if err := c.DeferJob(ctx, job, time.Now().Add(time.Hour), "github rate limit"); err != nil {
 		t.Fatalf("DeferJob: %v", err)
 	}
+	tick()
 	if claimed() {
 		t.Fatal("deferred job with retry_after one hour ahead was claimed")
 	}
@@ -68,6 +69,7 @@ func TestDeferJobRespectsRetryAfter(t *testing.T) {
 	if err := c.DeferJob(ctx, job, time.Now().Add(-time.Minute), "github rate limit"); err != nil {
 		t.Fatalf("DeferJob (past): %v", err)
 	}
+	tick()
 	if !claimed() {
 		t.Fatal("deferred job whose retry_after has passed was not claimable")
 	}

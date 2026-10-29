@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/seebom-labs/bomhort/backend/internal/claimlock"
 	"github.com/seebom-labs/bomhort/backend/pkg/models"
 )
 
@@ -76,9 +79,11 @@ func latestJobs(where string) string {
 		        argMax(source_file, created_at)  AS source_file,
 		        argMax(sha256_hash, created_at)  AS sha256_hash,
 		        min(created_at)                  AS min_created,
+		        max(created_at)                  AS version,
 		        argMax(job_type, created_at)      AS job_type,
 		        argMax(status, created_at)        AS latest_status,
 		        argMax(claimed_at, created_at)    AS claimed_at,
+		        argMax(claimed_by, created_at)    AS claimed_by,
 		        argMax(cluster, created_at)       AS cluster,
 		        argMax(namespace, created_at)     AS namespace,
 		        argMax(project, created_at)       AS project,
@@ -93,13 +98,13 @@ func latestJobs(where string) string {
 }
 
 // selectJobs returns the jobs whose latest state matches where, oldest first.
-func (c *Client) selectJobs(ctx context.Context, where string, limit int) ([]models.IngestionJob, error) {
+func (c *Client) selectJobs(ctx context.Context, where string, limit int, args ...any) ([]models.IngestionJob, error) {
 	rows, err := c.Conn.Query(ctx, `
-		SELECT job_id, source_file, sha256_hash, min_created, job_type, cluster, namespace, project, source_repo, source_ref, target_sbom_id, tags, parent
+		SELECT job_id, source_file, sha256_hash, min_created, version, job_type, cluster, namespace, project, source_repo, source_ref, target_sbom_id, tags, parent
 		FROM (`+latestJobs("")+`) sub
 		WHERE `+where+`
 		ORDER BY min_created ASC
-		LIMIT ?`, limit)
+		LIMIT ?`, append(args, limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query jobs: %w", err)
 	}
@@ -108,7 +113,7 @@ func (c *Client) selectJobs(ctx context.Context, where string, limit int) ([]mod
 	var jobs []models.IngestionJob
 	for rows.Next() {
 		var job models.IngestionJob
-		if err := rows.Scan(&job.JobID, &job.SourceFile, &job.SHA256Hash, &job.CreatedAt, &job.JobType, &job.Cluster, &job.Namespace, &job.Project, &job.SourceRepo, &job.SourceRef, &job.TargetSBOMID, &job.Tags, &job.Parent); err != nil {
+		if err := rows.Scan(&job.JobID, &job.SourceFile, &job.SHA256Hash, &job.CreatedAt, &job.Version, &job.JobType, &job.Cluster, &job.Namespace, &job.Project, &job.SourceRepo, &job.SourceRef, &job.TargetSBOMID, &job.Tags, &job.Parent); err != nil {
 			return nil, fmt.Errorf("failed to scan job row: %w", err)
 		}
 		jobs = append(jobs, job)
@@ -116,23 +121,63 @@ func (c *Client) selectJobs(ctx context.Context, where string, limit int) ([]mod
 	return jobs, rows.Err()
 }
 
-// ClaimJobs selects up to `limit` pending jobs and marks them as processing.
-// Uses argMax aggregation to reliably determine the latest status per job,
-// regardless of merge timing. This avoids phantom re-claims entirely.
-func (c *Client) ClaimJobs(ctx context.Context, workerID string, limit int) ([]models.IngestionJob, error) {
+// ClaimJobs selects up to `limit` pending jobs and marks them as processing
+// while holding the shared claim lock. It first releases this worker's own
+// jobs still marked processing: the worker holds no job between two calls, so
+// such rows come from a claim whose result was discarded (claimlock.ErrLeaseLost)
+// or from a crash, and must not wait for RequeueStaleJobs.
+func (c *Client) ClaimJobs(ctx context.Context, workerID string, limit int, locker claimlock.Locker) ([]models.IngestionJob, error) {
+	if locker == nil {
+		return nil, fmt.Errorf("claim lock is required")
+	}
+	var claimed []models.IngestionJob
+	err := locker.WithLock(ctx, func(ctx context.Context) error {
+		if err := c.releaseOwnClaims(ctx, workerID); err != nil {
+			return err
+		}
+		var err error
+		claimed, err = c.claimJobs(ctx, workerID, limit)
+		return err
+	})
+	return claimed, err
+}
+
+func (c *Client) releaseOwnClaims(ctx context.Context, workerID string) error {
+	orphaned, err := c.selectJobs(ctx, "latest_status = 'processing' AND claimed_by = ?", 10000, workerID)
+	if err != nil {
+		return fmt.Errorf("failed to query own claims: %w", err)
+	}
+	for _, job := range orphaned {
+		if err := c.DeferJob(ctx, job, time.Now(), "requeued: claim abandoned by "+workerID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) claimJobs(ctx context.Context, workerID string, limit int) ([]models.IngestionJob, error) {
 	jobs, err := c.selectJobs(ctx, "latest_status = 'pending' AND retry_after <= now()", limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending jobs: %w", err)
 	}
-	now := time.Now()
-	for i := range jobs {
-		jobs[i].Status = models.JobStatusProcessing
-		jobs[i].ClaimedBy = workerID
-		jobs[i].ClaimedAt = &now
-	}
-
 	if len(jobs) == 0 {
 		return nil, nil
+	}
+	// Claims use the server clock like every other transition, so a worker
+	// with a fast clock cannot write a claim that outranks its own completion.
+	var serverNow time.Time
+	if err := c.Conn.QueryRow(ctx, "SELECT now64(3)").Scan(&serverNow); err != nil {
+		return nil, fmt.Errorf("failed to read server time: %w", err)
+	}
+	for i := range jobs {
+		version := serverNow
+		if next := jobs[i].Version.Add(time.Millisecond); next.After(version) {
+			version = next
+		}
+		jobs[i].Version = version
+		jobs[i].Status = models.JobStatusProcessing
+		jobs[i].ClaimedBy = workerID
+		jobs[i].ClaimedAt = &version
 	}
 
 	// Mark claimed jobs as processing.
@@ -143,7 +188,7 @@ func (c *Client) ClaimJobs(ctx context.Context, workerID string, limit int) ([]m
 
 	for _, job := range jobs {
 		if err := batch.Append(
-			now,
+			job.Version,
 			job.JobID,
 			job.SourceFile,
 			job.SHA256Hash,
@@ -171,7 +216,71 @@ func (c *Client) ClaimJobs(ctx context.Context, workerID string, limit int) ([]m
 		return nil, fmt.Errorf("failed to send claim batch: %w", err)
 	}
 
-	return jobs, nil
+	jobIDs := make([]uuid.UUID, len(jobs))
+	for i := range jobs {
+		jobIDs[i] = jobs[i].JobID
+	}
+	owned, err := c.ownClaimedJobIDs(ctx, jobIDs, workerID)
+	if err != nil {
+		return nil, err
+	}
+	claimed := jobs[:0]
+	for _, job := range jobs {
+		if _, ok := owned[job.JobID]; ok {
+			claimed = append(claimed, job)
+		}
+	}
+	return claimed, nil
+}
+
+// ownClaimedJobIDs confirms that each persisted claim still belongs to this
+// worker before returning it for processing.
+func (c *Client) ownClaimedJobIDs(ctx context.Context, jobIDs []uuid.UUID, workerID string) (map[uuid.UUID]struct{}, error) {
+	jobIDStrings := make([]string, len(jobIDs))
+	for i := range jobIDs {
+		jobIDStrings[i] = jobIDs[i].String()
+	}
+	rows, err := c.Conn.Query(ctx, `
+		SELECT toString(job_id), argMax(status, created_at), argMax(claimed_by, created_at)
+		FROM ingestion_queue
+		WHERE toString(job_id) IN (?)
+		GROUP BY job_id
+	`, jobIDStrings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify claimed jobs: %w", err)
+	}
+	defer rows.Close()
+
+	owned := make(map[uuid.UUID]struct{}, len(jobIDs))
+	for rows.Next() {
+		var jobID string
+		var status, claimedBy string
+		if err := rows.Scan(&jobID, &status, &claimedBy); err != nil {
+			return nil, fmt.Errorf("failed to scan claimed job: %w", err)
+		}
+		if status == models.JobStatusProcessing && claimedBy == workerID {
+			parsedID, err := uuid.Parse(jobID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse claimed job ID: %w", err)
+			}
+			owned[parsedID] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read claimed jobs: %w", err)
+	}
+	return owned, nil
+}
+
+// nextVersion is the created_at of a status transition: the server's clock,
+// but always at least one millisecond after the job's previous row.
+const nextVersion = "greatest(now64(3), fromUnixTimestamp64Milli(toInt64(?)) + toIntervalMillisecond(1))"
+
+func versionMilli(job models.IngestionJob) int64 {
+	if job.Version.IsZero() {
+		return 0
+	}
+	return job.Version.UnixMilli()
 }
 
 // CompleteJob marks a job as done.
@@ -179,8 +288,8 @@ func (c *Client) CompleteJob(ctx context.Context, job models.IngestionJob) error
 	now := time.Now()
 	return c.Conn.Exec(ctx,
 		`INSERT INTO ingestion_queue (`+queueColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		now, job.JobID, job.SourceFile, job.SHA256Hash, models.JobStatusDone, job.JobType, job.ClaimedBy, job.ClaimedAt, &now, "", job.Cluster, job.Namespace, job.Project, job.SourceRepo, job.SourceRef, job.TargetSBOMID, job.Tags, job.Parent, time.Time{})
+		 VALUES (`+nextVersion+`, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		versionMilli(job), job.JobID, job.SourceFile, job.SHA256Hash, models.JobStatusDone, job.JobType, job.ClaimedBy, job.ClaimedAt, &now, "", job.Cluster, job.Namespace, job.Project, job.SourceRepo, job.SourceRef, job.TargetSBOMID, job.Tags, job.Parent, time.Time{})
 }
 
 // FailJob marks a job as failed with an error message.
@@ -188,8 +297,8 @@ func (c *Client) FailJob(ctx context.Context, job models.IngestionJob, errMsg st
 	now := time.Now()
 	return c.Conn.Exec(ctx,
 		`INSERT INTO ingestion_queue (`+queueColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		now, job.JobID, job.SourceFile, job.SHA256Hash, models.JobStatusFailed, job.JobType, job.ClaimedBy, job.ClaimedAt, &now, errMsg, job.Cluster, job.Namespace, job.Project, job.SourceRepo, job.SourceRef, job.TargetSBOMID, job.Tags, job.Parent, time.Time{})
+		 VALUES (`+nextVersion+`, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		versionMilli(job), job.JobID, job.SourceFile, job.SHA256Hash, models.JobStatusFailed, job.JobType, job.ClaimedBy, job.ClaimedAt, &now, errMsg, job.Cluster, job.Namespace, job.Project, job.SourceRepo, job.SourceRef, job.TargetSBOMID, job.Tags, job.Parent, time.Time{})
 }
 
 // DeferJob puts a claimed job back to 'pending' so that ClaimJobs picks it up
@@ -201,8 +310,8 @@ func (c *Client) FailJob(ctx context.Context, job models.IngestionJob, errMsg st
 func (c *Client) DeferJob(ctx context.Context, job models.IngestionJob, retryAfter time.Time, reason string) error {
 	return c.Conn.Exec(ctx,
 		`INSERT INTO ingestion_queue (`+queueColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now(), job.JobID, job.SourceFile, job.SHA256Hash, models.JobStatusPending, job.JobType, "", (*time.Time)(nil), (*time.Time)(nil), reason, job.Cluster, job.Namespace, job.Project, job.SourceRepo, job.SourceRef, job.TargetSBOMID, job.Tags, job.Parent, retryAfter)
+		 VALUES (`+nextVersion+`, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		versionMilli(job), job.JobID, job.SourceFile, job.SHA256Hash, models.JobStatusPending, job.JobType, "", (*time.Time)(nil), (*time.Time)(nil), reason, job.Cluster, job.Namespace, job.Project, job.SourceRepo, job.SourceRef, job.TargetSBOMID, job.Tags, job.Parent, retryAfter)
 }
 
 // RequeueStaleJobs puts jobs back to 'pending' that have been 'processing'
